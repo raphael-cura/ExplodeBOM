@@ -1,0 +1,874 @@
+# 'dataset' holds the input data for this script
+
+import pandas as pd
+import numpy as np
+from collections import deque
+from typing import Optional, Iterable, Dict, Tuple, List
+import logging
+import warnings
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Constants
+EPSILON = 1e-12
+MIN_QUANTITY_THRESHOLD = 1e-12
+
+
+class BOMExplosionError(Exception):
+    """Custom exception for BOM explosion errors."""
+    pass
+
+
+def explode_bom(
+    df_bom: pd.DataFrame,
+    key_colfilial: Optional[str] = None,
+    roots: Optional[Iterable[int]] = None,
+    max_depth: int = 50,
+    max_iter: int = 20,
+    tol: float = 1e-9,
+    intermediate_handling: str = "split",
+    enable_logging: bool = True
+) -> pd.DataFrame:
+    """
+    Explode Bill of Materials (BOM) recursively with iterative rebalancing.
+    
+    This function performs a multi-phase BOM explosion:
+    1. **Aggregation**: Pre-compute totals and edge ratios
+    2. **Expansion**: Build full path tree using BFS with cycle detection
+    3. **Rebalancing**: Iteratively adjust quantities to respect production constraints
+    4. **Segmentation**: Split materials into produced vs. basic (raw materials)
+    
+    Args:
+        df_bom: Input DataFrame with BOM structure
+        key_colfilial: Filter by specific branch/facility (optional)
+        roots: Specific root product IDs to explode (optional, None = all)
+        max_depth: Maximum BOM tree depth to prevent infinite expansion
+        max_iter: Maximum iterations for rebalancing convergence
+        tol: Convergence tolerance for rebalancing algorithm
+        intermediate_handling: How to handle intermediate products
+            - "split": Split into produced (is_basic=0) and external (is_basic=1) based on 
+                      production vs consumption (default behavior)
+            - "full_intermediate": Always treat intermediates as is_basic=0, skip rebalancing
+                                  and always explode their BOM
+        enable_logging: Enable progress logging
+        
+    Returns:
+        DataFrame with exploded BOM
+        
+    Raises:
+        BOMExplosionError: If BOM structure is invalid
+        ValueError: If required columns are missing
+    """
+    
+    # Validate parameter
+    if intermediate_handling not in ["split", "full_intermediate"]:
+        raise ValueError(f"intermediate_handling must be 'split' or 'full_intermediate', got '{intermediate_handling}'")
+    
+    # ============================================================================
+    # PHASE 0: Validation
+    # ============================================================================
+    _validate_input(df_bom)
+    
+    if enable_logging:
+        logger.info(f"Starting BOM explosion. Input rows: {len(df_bom)}")
+        logger.info(f"Intermediate handling mode: {intermediate_handling}")
+    
+    # Filter by facility if specified
+    df = (
+        df_bom[df_bom["key_colfilial"] == key_colfilial].copy()
+        if key_colfilial is not None
+        else df_bom.copy()
+    )
+    
+    if df.empty:
+        logger.warning("No data after filtering. Returning empty DataFrame.")
+        return _empty_result_dataframe()
+    
+    # ============================================================================
+    # PHASE 1: Aggregation - Compute totals and ratios
+    # ============================================================================
+    pa_totals, mp_totals, edge_ratios = _compute_aggregations(df)
+    
+    # Build lookup structures
+    children_map = _build_children_map(edge_ratios)
+    pa_total_map = _build_pa_total_map(pa_totals)
+    
+    # Determine roots to process
+    root_keys = _determine_roots(roots, pa_total_map, key_colfilial)
+    
+    if enable_logging:
+        logger.info(f"Processing {len(root_keys)} root products")
+    
+    # ============================================================================
+    # PHASE 2-4: Process each root
+    # ============================================================================
+    all_final_rows = []
+    
+    for root_key in root_keys:
+        try:
+            root_rows = _process_single_root(
+                root_key=root_key,
+                pa_total_map=pa_total_map,
+                children_map=children_map,
+                max_depth=max_depth,
+                max_iter=max_iter,
+                tol=tol,
+                intermediate_handling=intermediate_handling
+            )
+            all_final_rows.extend(root_rows)
+            
+        except Exception as e:
+            logger.error(f"Failed processing root {root_key}: {e}")
+            if enable_logging:
+                raise BOMExplosionError(f"BOM explosion failed for root {root_key}") from e
+    
+    # ============================================================================
+    # PHASE 5: Finalize output
+    # ============================================================================
+    if not all_final_rows:
+        logger.warning("No results generated")
+        return _empty_result_dataframe()
+    
+    df_final = _finalize_dataframe(all_final_rows)
+    
+    # For full_intermediate mode, aggregate duplicate raw materials
+    if intermediate_handling == "full_intermediate":
+        df_final = _aggregate_raw_materials(df_final)
+    
+    if enable_logging:
+        logger.info(f"BOM explosion complete. Output rows: {len(df_final)}")
+        logger.info(f"Basic materials: {(df_final['is_basic']==1).sum()}, "
+                   f"Produced components: {(df_final['is_basic']==0).sum()}")
+    
+    return df_final
+
+
+# ==============================================================================
+# HELPER FUNCTIONS
+# ==============================================================================
+
+def _validate_input(df_bom: pd.DataFrame) -> None:
+    """Validate input DataFrame has required columns."""
+    required = {
+        "ano", "mes", "key_colfilial",
+        "codordem", "idprd_pa", "qtde_pa",
+        "idprd_mp", "qtde_mp"
+    }
+    missing = required - set(df_bom.columns)
+    if missing:
+        raise ValueError(f"Missing required columns: {missing}")
+    
+    if df_bom.empty:
+        raise ValueError("Input DataFrame is empty")
+
+
+def _compute_aggregations(
+    df: pd.DataFrame
+) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """
+    Compute aggregated totals and edge ratios.
+    
+    Returns:
+        (pa_totals, mp_totals, edge_ratios)
+    """
+    # Parent product totals (sum across all orders)
+    pa_totals = (
+        df[["ano", "mes", "key_colfilial", "codordem", "idprd_pa", "qtde_pa"]]
+        .drop_duplicates(["ano", "mes", "key_colfilial", "codordem", "idprd_pa"])
+        .groupby(["ano", "mes", "key_colfilial", "idprd_pa"], as_index=False)
+        .agg(qtde_pa_total=("qtde_pa", "sum"))
+    )
+    
+    # Material totals per parent
+    mp_totals = (
+        df.groupby(
+            ["ano", "mes", "key_colfilial", "codordem", "idprd_pa", "idprd_mp"],
+            as_index=False
+        )
+        .agg(qtde_mp_order=("qtde_mp", "sum"))
+        .groupby(
+            ["ano", "mes", "key_colfilial", "idprd_pa", "idprd_mp"],
+            as_index=False
+        )
+        .agg(qtde_mp_total=("qtde_mp_order", "sum"))
+    )
+    
+    # Compute edge ratios (material qty / parent qty)
+    edge_ratios = mp_totals.merge(
+        pa_totals,
+        on=["ano", "mes", "key_colfilial", "idprd_pa"],
+        how="left"
+    )
+    
+    # Vectorized ratio computation
+    edge_ratios["ratio"] = np.where(
+        edge_ratios["qtde_pa_total"] > 0,
+        edge_ratios["qtde_mp_total"] / edge_ratios["qtde_pa_total"],
+        0.0
+    )
+    
+    return pa_totals, mp_totals, edge_ratios
+
+
+def _build_children_map(
+    edge_ratios: pd.DataFrame
+) -> Dict[Tuple[int, int, str, int], List[Tuple[int, float]]]:
+    """Build mapping of parent -> [(child, ratio), ...]"""
+    children_map = {}
+    
+    # Use itertuples for better performance than iterrows
+    for row in edge_ratios.sort_values(["idprd_pa", "idprd_mp"]).itertuples():
+        key = (row.ano, row.mes, row.key_colfilial, row.idprd_pa)
+        children_map.setdefault(key, []).append((row.idprd_mp, row.ratio))
+    
+    return children_map
+
+
+def _build_pa_total_map(
+    pa_totals: pd.DataFrame
+) -> Dict[Tuple[int, int, str, int], float]:
+    """Build mapping of (ano, mes, facility, product) -> total quantity"""
+    return {
+        (row.ano, row.mes, row.key_colfilial, row.idprd_pa): row.qtde_pa_total
+        for row in pa_totals.itertuples()
+    }
+
+
+def _determine_roots(
+    roots: Optional[Iterable[int]],
+    pa_total_map: Dict[Tuple[int, int, str, int], float],
+    key_colfilial: Optional[str]
+) -> List[Tuple[int, int, str, int]]:
+    """Determine which root products to process."""
+    if roots is None:
+        return sorted(pa_total_map.keys())
+    
+    root_set = set(int(r) for r in roots)
+    root_keys = [
+        key for key in pa_total_map.keys()
+        if key[3] in root_set and (key_colfilial is None or key[2] == key_colfilial)
+    ]
+    
+    if not root_keys:
+        logger.warning(f"No matching roots found for specified IDs: {roots}")
+    
+    return sorted(root_keys)
+
+
+def _process_single_root(
+    root_key: Tuple[int, int, str, int],
+    pa_total_map: Dict[Tuple[int, int, str, int], float],
+    children_map: Dict[Tuple[int, int, str, int], List[Tuple[int, float]]],
+    max_depth: int,
+    max_iter: int,
+    tol: float,
+    intermediate_handling: str
+) -> List[Dict]:
+    """Process a single root product through all explosion phases."""
+    ano, mes, key_col, pa_root = root_key
+    root_qty = pa_total_map[root_key]
+    
+    # Phase 2: Initial BFS expansion
+    df_edges, loop_detected = _bfs_expansion(
+        root_node=pa_root,
+        root_qty=root_qty,
+        ano=ano,
+        mes=mes,
+        key_col=key_col,
+        children_map=children_map,
+        max_depth=max_depth
+    )
+    
+    if df_edges.empty:
+        return []
+    
+    # Phase 3: Iterative rebalancing (only for split mode)
+    if intermediate_handling == "split":
+        df_edges = _iterative_rebalancing(
+            df_edges=df_edges,
+            pa_total_map=pa_total_map,
+            ano=ano,
+            mes=mes,
+            key_col=key_col,
+            root_node=pa_root,
+            root_qty=root_qty,
+            max_iter=max_iter,
+            tol=tol
+        )
+    else:  # full_intermediate
+        # No rebalancing - all quantities stay as expanded
+        # Mark as produced (will be filtered in segmentation)
+        df_edges["produced_part"] = df_edges["qty_edge"]
+        df_edges["basic_part"] = 0.0
+    
+    # Phase 4: Segmentation into produced/basic
+    final_rows = _segment_edges(
+        df_edges=df_edges,
+        ano=ano,
+        mes=mes,
+        key_col=key_col,
+        pa_root=pa_root,
+        root_qty=root_qty,
+        intermediate_handling=intermediate_handling,
+        children_map=children_map
+    )
+    
+    return final_rows
+
+
+def _bfs_expansion(
+    root_node: int,
+    root_qty: float,
+    ano: int,
+    mes: int,
+    key_col: str,
+    children_map: Dict[Tuple[int, int, str, int], List[Tuple[int, float]]],
+    max_depth: int
+) -> Tuple[pd.DataFrame, bool]:
+    """
+    Perform BFS expansion of BOM tree with cycle detection.
+    
+    Returns:
+        (df_edges, loop_detected)
+    """
+    q = deque()
+    q.append((root_node, root_qty, (root_node,), 0, False))
+    
+    rows = []
+    loop_detected = False
+    
+    while q:
+        node, qty, path, nivel, has_loop = q.popleft()
+        
+        # Check max depth
+        if nivel >= max_depth:
+            logger.warning(f"Max depth {max_depth} reached for path {path}")
+            rows.append({
+                "path_str": _format_path(path),
+                "idprd_mp": node,
+                "ratio": None,
+                "nivel": nivel,
+                "qtde_pa": root_qty,
+                "qtde_mp": qty,
+                "has_loop": has_loop
+            })
+            continue
+        
+        key_node = (ano, mes, key_col, node)
+        children = children_map.get(key_node)
+        
+        # Leaf node - no children
+        if not children:
+            rows.append({
+                "path_str": _format_path(path),
+                "idprd_mp": node,
+                "ratio": None,
+                "nivel": nivel,
+                "qtde_pa": root_qty,
+                "qtde_mp": qty,
+                "has_loop": has_loop
+            })
+            continue
+        
+        # Process each child
+        for child, ratio in children:
+            next_qty = qty * ratio
+            path_next = path + (child,)
+            
+            # Cycle detection
+            child_has_loop = has_loop or (child in path)
+            if child_has_loop:
+                loop_detected = True
+            
+            rows.append({
+                "path_str": _format_path(path_next),
+                "idprd_mp": child,
+                "ratio": ratio,
+                "nivel": nivel + 1,
+                "qtde_pa": root_qty,
+                "qtde_mp": next_qty,
+                "has_loop": child_has_loop
+            })
+            
+            # Continue expansion only if no cycle and child has children
+            child_has_children = (ano, mes, key_col, child) in children_map
+            if child_has_children and not child_has_loop:
+                q.append((child, next_qty, path_next, nivel + 1, child_has_loop))
+    
+    if not rows:
+        return pd.DataFrame(), loop_detected
+    
+    df_edges = pd.DataFrame(rows).sort_values("nivel").reset_index(drop=True)
+    df_edges["parent_path"] = df_edges["path_str"].apply(_get_parent_path)
+    df_edges["qty_edge"] = df_edges["qtde_mp"].astype(float)
+    
+    return df_edges, loop_detected
+
+
+def _iterative_rebalancing(
+    df_edges: pd.DataFrame,
+    pa_total_map: Dict[Tuple[int, int, str, int], float],
+    ano: int,
+    mes: int,
+    key_col: str,
+    root_node: int,
+    root_qty: float,
+    max_iter: int,
+    tol: float
+) -> pd.DataFrame:
+    """
+    Iteratively rebalance edge quantities to respect production constraints.
+    
+    This ensures that if a material is both consumed and produced,
+    the consumed quantity doesn't exceed the produced quantity.
+    """
+    # Build production capacity map
+    produced_map = {
+        pa_id: qty
+        for (a, m, k, pa_id), qty in pa_total_map.items()
+        if a == ano and m == mes and k == key_col
+    }
+    
+    prev_ratio_map = {}
+    converged = False
+    
+    for iteration in range(max_iter):
+        # Compute total consumed per material
+        total_consumed = (
+            df_edges.groupby("idprd_mp", as_index=False)
+            .agg(total_consumed=("qty_edge", "sum"))
+        )
+        
+        # Vectorized produced_ratio computation
+        total_consumed["produced_total"] = total_consumed["idprd_mp"].map(
+            produced_map
+        ).fillna(0.0)
+        
+        total_consumed["produced_ratio"] = np.minimum(
+            1.0,
+            np.where(
+                total_consumed["total_consumed"] > 0,
+                total_consumed["produced_total"] / total_consumed["total_consumed"],
+                0.0
+            )
+        )
+        
+        ratio_map = dict(zip(
+            total_consumed["idprd_mp"],
+            total_consumed["produced_ratio"]
+        ))
+        
+        # Check convergence
+        if iteration > 0:
+            max_change = max(
+                abs(ratio_map.get(k, 0) - prev_ratio_map.get(k, 0))
+                for k in set(ratio_map.keys()) | set(prev_ratio_map.keys())
+            )
+            
+            if max_change < tol:
+                converged = True
+                logger.debug(f"Converged in {iteration} iterations")
+                break
+        
+        prev_ratio_map = ratio_map.copy()
+        
+        # Compute produced_part using vectorized operations
+        df_edges["produced_part"] = (
+            df_edges["qty_edge"] *
+            df_edges["idprd_mp"].map(ratio_map).fillna(0.0)
+        )
+        
+        # Build produced_part lookup
+        produced_part_map = dict(zip(
+            df_edges["path_str"],
+            df_edges["produced_part"]
+        ))
+        produced_part_map[f"|{root_node}|"] = root_qty  # Add root
+        
+        # Recompute qty_edge by propagating parent produced_part
+        new_qty = []
+        for row in df_edges.itertuples():
+            parent_path = row.parent_path
+            ratio = row.ratio if pd.notna(row.ratio) else 1.0
+            
+            parent_prod = produced_part_map.get(parent_path, 0.0)
+            new_qty.append(parent_prod * ratio)
+        
+        df_edges["qty_edge"] = new_qty
+    
+    # Warn if not converged
+    if not converged:
+        max_change = max(
+            abs(ratio_map.get(k, 0) - prev_ratio_map.get(k, 0))
+            for k in set(ratio_map.keys()) | set(prev_ratio_map.keys())
+        )
+        warnings.warn(
+            f"Rebalancing did not converge after {max_iter} iterations. "
+            f"Max change: {max_change:.2e} > tolerance: {tol:.2e}"
+        )
+    
+    # Compute final produced/basic parts
+    df_edges["produced_part"] = (
+        df_edges["qty_edge"] *
+        df_edges["idprd_mp"].map(prev_ratio_map).fillna(0.0)
+    )
+    df_edges["basic_part"] = df_edges["qty_edge"] - df_edges["produced_part"]
+    
+    return df_edges
+
+
+def _segment_edges(
+    df_edges: pd.DataFrame,
+    ano: int,
+    mes: int,
+    key_col: str,
+    pa_root: int,
+    root_qty: float,
+    intermediate_handling: str,
+    children_map: Dict[Tuple[int, int, str, int], List[Tuple[int, float]]]
+) -> List[Dict]:
+    """
+    Split edges into produced components and basic materials.
+    
+    In "split" mode:
+        - Each edge may generate two rows based on produced/basic split
+    
+    In "full_intermediate" mode:
+        - Only create rows for materials that DON'T have a BOM (true raw materials)
+        - Skip any material that has children (intermediates are fully exploded)
+    """
+    final_rows = []
+    
+    for row in df_edges.itertuples():
+        # Check if this material is an intermediate (has a BOM)
+        key_node = (ano, mes, key_col, row.idprd_mp)
+        is_intermediate = key_node in children_map
+        
+        if intermediate_handling == "full_intermediate":
+            # Only output if this is a TRUE basic material (no BOM)
+            if not is_intermediate:
+                # This is a raw material - output as basic
+                if row.produced_part > MIN_QUANTITY_THRESHOLD:
+                    basic_ratio = row.produced_part / root_qty if root_qty > 0 else 0.0
+                    final_rows.append({
+                        "ano": ano,
+                        "mes": mes,
+                        "key_colfilial": key_col,
+                        "idprd_pa": pa_root,
+                        "qtde_pa": root_qty,
+                        "idprd_mp": row.idprd_mp,
+                        "qtde_mp": row.produced_part,
+                        "nivel": row.nivel,
+                        "has_loop": row.has_loop,
+                        "path_str": row.path_str,
+                        "ratio": row.ratio,
+                        "is_basic": 1,
+                        "basic_ratio": basic_ratio
+                    })
+            # If it's an intermediate, skip it - it's already been exploded in BFS
+            
+        else:  # "split" mode - original behavior
+            # Produced component row
+            if row.produced_part > MIN_QUANTITY_THRESHOLD:
+                final_rows.append({
+                    "ano": ano,
+                    "mes": mes,
+                    "key_colfilial": key_col,
+                    "idprd_pa": pa_root,
+                    "qtde_pa": root_qty,
+                    "idprd_mp": row.idprd_mp,
+                    "qtde_mp": row.produced_part,
+                    "nivel": row.nivel,
+                    "has_loop": row.has_loop,
+                    "path_str": row.path_str,
+                    "ratio": row.ratio,
+                    "is_basic": 0,
+                    "basic_ratio": 0.0
+                })
+            
+            # Basic material row
+            if row.basic_part > MIN_QUANTITY_THRESHOLD:
+                basic_ratio = row.basic_part / root_qty if root_qty > 0 else 0.0
+                final_rows.append({
+                    "ano": ano,
+                    "mes": mes,
+                    "key_colfilial": key_col,
+                    "idprd_pa": pa_root,
+                    "qtde_pa": root_qty,
+                    "idprd_mp": row.idprd_mp,
+                    "qtde_mp": row.basic_part,
+                    "nivel": row.nivel,
+                    "has_loop": row.has_loop,
+                    "path_str": row.path_str,
+                    "ratio": row.ratio,
+                    "is_basic": 1,
+                    "basic_ratio": basic_ratio
+                })
+    
+    return final_rows
+
+
+def _finalize_dataframe(rows: List[Dict]) -> pd.DataFrame:
+    """Convert row list to final DataFrame with proper types."""
+    df = pd.DataFrame(rows)
+    
+    # Type conversions
+    df["qtde_mp"] = pd.to_numeric(df["qtde_mp"], errors="coerce").fillna(0.0)
+    df["qtde_pa"] = pd.to_numeric(df["qtde_pa"], errors="coerce").fillna(0.0)
+    df["nivel"] = df["nivel"].astype(int)
+    df["has_loop"] = df["has_loop"].astype(bool)
+    df["is_basic"] = df["is_basic"].astype(int)
+    df["basic_ratio"] = pd.to_numeric(
+        df.get("basic_ratio", 0.0),
+        errors="coerce"
+    ).fillna(0.0)
+    
+    # Sort for consistency
+    df = df.sort_values(
+        ["ano", "mes", "key_colfilial", "idprd_pa", "nivel", "idprd_mp"]
+    ).reset_index(drop=True)
+    
+    return df
+
+
+def _empty_result_dataframe() -> pd.DataFrame:
+    """Return empty DataFrame with correct schema."""
+    return pd.DataFrame(columns=[
+        "ano", "mes", "key_colfilial",
+        "idprd_pa", "qtde_pa",
+        "idprd_mp", "qtde_mp",
+        "nivel", "has_loop", "path_str", "ratio",
+        "is_basic", "basic_ratio"
+    ])
+
+
+def _format_path(path: Tuple[int, ...]) -> str:
+    """Format path tuple as string: (1,2,3) -> '|1|2|3|'"""
+    return "|" + "|".join(map(str, path)) + "|"
+
+
+def _get_parent_path(path_str: str) -> Optional[str]:
+    """Extract parent path from path string."""
+    s = path_str.rstrip("|")
+    idx = s.rfind("|")
+    if idx == -1:
+        return None
+    return s[:idx + 1]
+
+
+def _aggregate_raw_materials(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Aggregate raw materials in full_intermediate mode.
+    
+    Since the same raw material can appear through multiple paths
+    (e.g., 45299 through |6913|45299| and |6913|279|45299|),
+    we need to sum them up to get the total requirement.
+    
+    We keep the shortest path (lowest nivel) for each material.
+    """
+    if df.empty:
+        return df
+    
+    # Group by root and material
+    aggregated = (
+        df.groupby(['ano', 'mes', 'key_colfilial', 'idprd_pa', 'qtde_pa', 'idprd_mp', 'is_basic'])
+        .agg({
+            'qtde_mp': 'sum',  # Sum quantities from all paths
+            'nivel': 'min',    # Keep shortest path level
+            'has_loop': 'any',
+            'path_str': 'first',  # Keep first path (could be min nivel)
+            'ratio': 'first',
+            'basic_ratio': 'sum'  # Sum basic ratios
+        })
+        .reset_index()
+    )
+    
+    # Recalculate basic_ratio based on aggregated quantities
+    aggregated['basic_ratio'] = np.where(
+        aggregated['qtde_pa'] > 0,
+        aggregated['qtde_mp'] / aggregated['qtde_pa'],
+        0.0
+    )
+    
+    # Sort for consistency
+    aggregated = aggregated.sort_values(
+        ['ano', 'mes', 'key_colfilial', 'idprd_pa', 'nivel', 'idprd_mp']
+    ).reset_index(drop=True)
+    
+    return aggregated
+
+
+# ====================================================
+# INPUT TABLES
+# ====================================================
+
+df_in = df.copy()
+df_out = df_explodido.copy()
+
+# ====================================================
+# OPTIONAL FILTERS
+# Leave as None to disable
+# ====================================================
+
+key_colfilial = None
+ano = None
+mes = None
+
+if key_colfilial is not None:
+    df_in = df_in[df_in["key_colfilial"] == key_colfilial]
+    df_out = df_out[df_out["key_colfilial"] == key_colfilial]
+
+if ano is not None:
+    df_in = df_in[df_in["ano"] == ano]
+    df_out = df_out[df_out["ano"] == ano]
+
+if mes is not None:
+    df_in = df_in[df_in["mes"] == mes]
+    df_out = df_out[df_out["mes"] == mes]
+
+# ====================================================
+# TOTAL PRODUCED
+# ====================================================
+
+produced = (
+    df_in[
+        [
+            "ano",
+            "mes",
+            "key_colfilial",
+            "idprd_pa",
+            "codordem",
+            "qtde_pa"
+        ]
+    ]
+    .drop_duplicates(
+        [
+            "ano",
+            "mes",
+            "key_colfilial",
+            "codordem",
+            "idprd_pa"
+        ]
+    )
+    .groupby(
+        [
+            "ano",
+            "mes",
+            "key_colfilial",
+            "idprd_pa"
+        ],
+        as_index=False
+    )
+    .agg(
+        produced_total=("qtde_pa", "sum")
+    )
+)
+
+# ====================================================
+# INTERMEDIATE CONSUMPTION
+# ====================================================
+
+consumed_inter_raw = (
+    df_out[
+        (df_out["is_basic"] == 0) &
+        (df_out["nivel"] == 1)
+    ]
+    .groupby(
+        [
+            "ano",
+            "mes",
+            "key_colfilial",
+            "idprd_mp"
+        ],
+        as_index=False
+    )
+    .agg(
+        consumed_intermediate_raw=("qtde_mp", "sum")
+    )
+    .rename(
+        columns={
+            "idprd_mp": "idprd_pa"
+        }
+    )
+)
+
+# ====================================================
+# MERGE
+# ====================================================
+
+summary = produced.merge(
+    consumed_inter_raw,
+    on=[
+        "ano",
+        "mes",
+        "key_colfilial",
+        "idprd_pa"
+    ],
+    how="left"
+)
+
+summary["consumed_intermediate_raw"] = (
+    summary["consumed_intermediate_raw"]
+    .fillna(0)
+)
+
+# ====================================================
+# LIMITED INTERMEDIATE CONSUMPTION
+# ====================================================
+
+summary["consumed_intermediate"] = np.minimum(
+    summary["produced_total"],
+    summary["consumed_intermediate_raw"]
+)
+
+# ====================================================
+# BASIC CONSUMPTION
+# ====================================================
+
+summary["consumed_basic"] = (
+    summary["consumed_intermediate_raw"]
+    - summary["consumed_intermediate"]
+)
+
+# ====================================================
+# NET PRODUCTION
+# ====================================================
+
+summary["net_production"] = (
+    summary["produced_total"]
+    - summary["consumed_intermediate"]
+)
+
+# ====================================================
+# OUTPUT
+# ====================================================
+
+dataset = summary[
+    [
+        "ano",
+        "mes",
+        "key_colfilial",
+        "idprd_pa",
+        "produced_total",
+        "consumed_intermediate",
+        "consumed_basic",
+        "net_production"
+    ]
+]
+
+
+df_input = dataset.copy()
+
+df_explodido = explode_bom(
+    df_bom=df_input,
+    max_depth=10,
+    max_iter=30,
+    intermediate_handling="full_intermediate"
+)
+
+result = summarize_production(
+    df_input=df_input,
+    df_s2=df_explodido
+)
